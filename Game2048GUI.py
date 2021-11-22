@@ -8,29 +8,6 @@ BASE_UNIT = 24
 TILE_DIM = 4.875
 DEBUG = False
 
-#class Tile(Text):
-    
-    #def __init__(self, **kwargs):
-        #self.position = kwargs.get('position', (0, 0)) # The location of the tile in terms of (row, col)
-        #self.source = self.position                    # Where the tile came from. Only different to position
-        #self.inPlace = kwargs.get('inPlace', True)     # Whether the coordinates of the tile matches its location
-        #self.toMerge = kwargs.get('toMerge', False)    # Whether a tile is going to merge into another tile and be deleted
-        
-        #super().__init__(**kwargs)
-        
-    #def get_target_coordinates(self):
-        #return self.location_to_coordinates(self.position)
-    
-    #def location_to_coordinates(self, location):
-        #x = (location[0] * (TILE_DIM + 0.5) + 0.5) * BASE_UNIT
-        #y = (location[1] * (TILE_DIM + 0.5) + 0.5) * BASE_UNIT
-        #return x, y
-    
-    #def move_to_target(self):
-        #self.coordinates = self.get_target_coordinates()
-        #self.source = self.position
-        #self.inPlace = True
-        
 
 class Board(myGUI):
     

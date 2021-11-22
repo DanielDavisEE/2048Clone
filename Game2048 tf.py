@@ -52,15 +52,15 @@ class GameEnv2048(py_environment.PyEnvironment):
         self._action_spec = array_spec.BoundedArraySpec(
             shape=(4,), dtype=np.float32, minimum=0, maximum=1, name='action')
         self._observation_spec = array_spec.BoundedArraySpec(
-            shape=(16,), dtype=np.int32, minimum=0, name='observation')
+            shape=(1,4,4,1), dtype=np.float32, minimum=0, name='observation')
 
         self._step_cap = 10
         self._softmax = tf.keras.layers.Softmax()
 
-        self._state = [0] * 16
-        self._merged = [False] * 16
+        self._state = np.zeros([4, 4], dtype=np.float32)
+        self._merged = np.zeros([4, 4], dtype=np.bool8)
         self._spawn_tile(2)
-        self._score = 0
+        self._score = np.array(0, dtype=np.float32)
         self._steps_since_score_increase = 0
         self._episode_ended = False
 
@@ -71,13 +71,13 @@ class GameEnv2048(py_environment.PyEnvironment):
         return self._observation_spec
 
     def _reset(self):
-        self._state = [0] * 16
-        self._merged = [False] * 16
+        self._state = np.zeros([4, 4], dtype=np.float32)
+        self._merged = np.zeros([4, 4], dtype=np.bool8)
         self._spawn_tile(2)
-        self._score = 0
+        self._score = np.array(0, dtype=np.float32)
         self._steps_since_score_increase = 0
         self._episode_ended = False
-        return ts.restart(np.array(self._state, dtype=np.int32))
+        return ts.restart(np.array(self._state.reshape(1,4,4,1), dtype=np.float32))
 
     def _step(self, action):
         """
@@ -87,96 +87,110 @@ class GameEnv2048(py_environment.PyEnvironment):
         left:  3
         """
         if self._steps_since_score_increase >= self._step_cap:
-            return ts.termination(np.array(self._state, dtype=np.int32), self._score) 
+            return ts.termination(self._state.reshape(1,4,4,1), self._score) 
         self._steps_since_score_increase += 1
-
-        directions = [0, 1, 2, 3]
-        direction = np.random.choice(
-            directions, 
-            p=self._softmax(action).numpy()
-        )
+        
+        if type(action) is int:
+            direction = action
+        else:
+            directions = [0, 1, 2, 3]
+            direction = np.random.choice(
+                directions, 
+                p=self._softmax(action).numpy()
+            )
 
         if not self._check_viable_move(direction):
-            return ts.transition(
-                np.array(self._state, dtype=np.int32), reward=0.0, discount=1.0)
+            return ts.transition(self._state.reshape(1,4,4,1), reward=0.0, discount=1.0)
 
         row_iter = (0, 4)
-        if direction == 2:
+        if direction == 2: # If direction is down, iterate rows upwards
             row_iter = (3, -1, -1)
         col_iter = (0, 4)
-        if direction == 1:
+        if direction == 1: # If direction is right, iterate columns leftwards
             col_iter = (3, -1, -1)
 
         for m in range(*row_iter):
             for n in range(*col_iter):
-                index = m * 4 + n
-                if self._state[index] == 0:
+                if self._state[m,n] == 0:
                     continue
 
-                self._move_tile(index, direction)
+                self._move_tile((m, n), direction)
 
-        self._merged = [False] * 16
+        self._merged = np.zeros([4, 4], dtype=np.bool8)
         gameLost = self._spawn_tile()
+        
         if gameLost:
             self._episode_ended = True
 
         if self._episode_ended:
-            return ts.termination(np.array(self._state, dtype=np.int32), self._score)
+            return ts.termination(self._state.reshape(1,4,4,1), self._score)
         else:
-            return ts.transition(
-                np.array(self._state, dtype=np.int32), reward=0.0, discount=0.95)
+            return ts.transition(self._state.reshape(1,4,4,1), reward=0.0, discount=0.95)
 
-    def _merge(self, index, new_index):
+    def _merge(self, coords, new_coords):
         """
-        Merge two tiles together i.e. the new_index value will double and the index value will be deleted.
+        Merge two tiles together i.e. the new_coords value will double and the coords value will be deleted.
         It is assumed that the merge is valid, if not the changes will occur anyway.
         """
-        self._state[new_index] *= 2
-        self._state[index] = 0
-        self._score += self._state[new_index]
+        self._state[new_coords] *= 2
+        self._state[coords] = 0
+        self._score += self._state[new_coords]
         self._steps_since_score_increase = 0
-        self._merged[new_index] = True
+        self._merged[new_coords] = True
 
-    def _move_tile(self, index, action):
+    def _move_tile(self, coords, action):
         """ Move a tile as far as possible in the indicated direction, merge 
         with other tile if they have the same value.
         Return a tuble of initial coordinates, new coordinates, and whether it 
         has been merged and whether it was moved.
-        index -> (row, col)
-        current_index -> (row, col)
+        coords -> (row, col)
+        current_coords -> (row, col)
         merged -> bool
         inPlace -> bool
+        
+        up:    0
+        right: 1
+        down:  2
+        left:  3
         """
 
         isVert = action % 2 == 0
         isPos = (action + 1) // 2 == 1
 
-        shift_amount = 4 if isVert else 1
-        increment = lambda i: i + shift_amount if isPos else i - shift_amount
+        def increment(c):
+            if action == 0: # Up
+                return c[0] - 1, c[1]
+            elif action == 1: # Right
+                return c[0], c[1] + 1
+            elif action == 2: # Down
+                return c[0] + 1, c[1]
+            elif action == 3: # Left
+                return c[0], c[1] - 1
+            else:
+                raise ValueError
+            
+        inBounds = lambda c: 0 <= c[0] < 4 and 0 <= c[1] < 4
 
-        row = index // 4
-        inBounds = lambda i: 0 <= i < 16 if isVert else row == i // 4
+        safe_coords = coords
+        next_coords = increment(safe_coords)
 
-        safe_index = index
-        next_index = increment(safe_index)
+        # If there is a valid, empty tile at the location of safe_coords, check the next location
+        while (inBounds(next_coords) and
+               self._state[next_coords] == 0):
 
-        # If there is a valid, empty tile at the location of safe_index, check the next location
-        while (inBounds(next_index) and
-               self._state[next_index] == 0):
+            safe_coords, next_coords = next_coords, increment(next_coords)
 
-            safe_index, next_index = next_index, increment(next_index)
+        if coords != safe_coords:
+            self._state[safe_coords] = self._state[coords]
+            self._state[coords] = 0
 
-        if index != safe_index:
-            self._state[safe_index] = self._state[index]
-            self._state[index] = 0
+        # If the location of next_coords is still a valid tile, and has a value equal to the
+        #    current location, and the next_coords tile hasn't already been merged, merge them on the next_coords
+        if (inBounds(next_coords) and 
+            self._state[safe_coords] == self._state[next_coords] and
+            self._merged[next_coords] == False):
 
-        # If the location of next_index is still a valid tile, and has a value equal to the
-        #    current location, and the next_index tile hasn't already been merged, merge them on the next_index
-        if (inBounds(next_index) and 
-            self._state[safe_index] == self._state[next_index] and
-            self._merged[next_index] == False):
-
-            self._merge(safe_index, next_index)
+            self._merge(safe_coords, next_coords)
 
     def _check_viable_move(self, action):
         """
@@ -186,37 +200,34 @@ class GameEnv2048(py_environment.PyEnvironment):
         For upwards and leftwards moves this means it must iterate the row/column in reverse.
         For upwards and downwards moves this means the coordinates must be switched to iterate by column then row.
 
-        up:    1
-        right: 2
-        down:  3
-        left:  4
+        up:    0
+        right: 1
+        down:  2
+        left:  3
         """
 
-        isPos = (action + 1) // 2 == 1
-        if isPos:
+        if action in [0, 3]:
             inner_iter = (0, 4)
         else:
             inner_iter = (3, -1, -1)
 
-        isVert = action % 2 == 0
-        to_index = lambda x, y: y * 4 + x if isVert else x * 4 + y
+        arrange_coords = lambda x, y: (y, x) if action in [0, 2] else (x, y)
 
         # Iterate orthogonally to the move
         for m in range(0, 4):
 
-            numFound, last_num = False, 0
+            spaceAvailable, last_num = False, 0
 
             # Iterate in the same direction as the move
             for n in range(*inner_iter):
-                value = self._state[to_index(m, n)] # Swap coordinates if vertical move
+                value = self._state[arrange_coords(m, n)] # Swap coordinates if vertical move
 
                 if value > 0: # Where 0 is the empty value
-                    if value == last_num: # Merge is possible
+                    if value == last_num or spaceAvailable: # Merge is possible or There is a gap for the number to move into
                         return True
-                    numFound, last_num = True, value
-
-                elif numFound == True: # There is a gap for a previously found number to move into
-                    return True
+                    last_num = value
+                else:
+                    spaceAvailable = True
 
         return False
 
@@ -225,110 +236,83 @@ class GameEnv2048(py_environment.PyEnvironment):
         Spawns either a 2 or a 4 in an empty square of the gameboard. By default, this happens once at a time.
         After each tile spawn, if there are no empty spots, check if a valid move exists.
         """
-        empty_tiles = self._state.count(0)
+        empty_tiles = (self._state == 0).sum()
         assert empty_tiles > 0
-
+        
+        def increment(c):
+            if c[1] < 3:
+                return c[0], c[1] + 1
+            else:
+                return c[0] + 1, c[1]
+            
+        def isGameOver():
+            for i in range(3):
+                for j in range(3):
+                    if(self._state[i, j] == self._state[i + 1, j] or
+                       self._state[i, j] == self._state[i, j + 1]):
+                        return False
+         
+            for j in range(3):
+                if(self._state[3, j] == self._state[3, j + 1]):
+                    return False
+         
+            for i in range(3):
+                if(self._state[i, 3] == self._state[i + 1, 3]):
+                    return False
+                
+            return True
+        
+        gameOver = False
         for _ in range(repeat):
             index = rd.randrange(0, empty_tiles)
-            index_tmp = index
 
             # Find the missing value which corresponds to index by iterating through
             #    the gameboard and decrementing the index to 0.
-            for i, value in enumerate(self._state):
-                if value == 0:
-                    if index_tmp == 0:
-                        self._state[i] = 2 if rd.random() < 0.9 else 4
-                        empty_tiles -= 1
-                        break
-                    index_tmp -= 1
+            for i, row in enumerate(self._state):
+                for j, value in enumerate(row):
+                    if value == 0:
+                        index -= 1
+                        if index < 0:
+                            self._state[i,j] = 2 if rd.random() < 0.9 else 4
+                            empty_tiles -= 1
+                            break
+                        
+                if index < 0:
+                    break
 
             # If the board has no empty slots, check for viable moves in every direction.
             if empty_tiles == 0:
-                for direction in range(1, 5):
-                    if self._check_viable_move(direction):
-                        break # A viable move exists
-                else:
-                    return True # The game is lost
+                if isGameOver():
+                    return True # The game is lost             
 
         return False
 
-
-def print_board(game_inst):
-    """
-    Prints the gameboard row by row with _ as empty tiles
-    """
-    print(game_inst._score)
-    board_string = ''
-    col = 0
-    for tile in game_inst._state:
-        value = '_' if tile == 0 else tile
-        board_string += f"{value:^4}"
-        col += 1
-        if col % 4 == 0:
+    def print_board(game_inst):
+        """
+        Prints the gameboard row by row with _ as empty tiles
+        """
+        print(game_inst._score)
+        board_string = ''
+        col = 0
+        for row in game_inst._state:
+            for tile in row:
+                value = '_' if tile == 0 else tile
+                board_string += f"{value:^4}"
             board_string += '\n'
-    print(board_string)
-
-def main():
-
-    move_dict = {'quit': 'q',
-                 'q': 'q',
-                 'w': 0,
-                 'd': 1,
-                 's': 2,
-                 'a': 3,
-                 'shhh': 'shhh'
-                 }
-
-    verbose = True
-
-    def get_move():
-        nonlocal verbose
-        move = None
-        while move is None:
-            try:
-                move = move_dict[input().lower()]
-            except KeyError:
-                if verbose:
-                    print("Invalid move.")
-            else:
-                if move == 'shhh':
-                    verbose = False
-                    move = None
-        return move
-
-    print("""To play, use the 'wasd' keys to input moves.
-To quit, type 'quit' or 'q'.
-To stop the 'Invlaid move.' dialogue, type 'shhh'.
-Follow all inputs with a newline press.
-    """)
-
-    play = True
-
-    while play == True:
-        gameLost = False
-        game_instance = GameEnv2048()
-        print_board(game_instance)
-        while not gameLost:
-            move = get_move()
-            if move == 'q':
-                break
-            game_instance._step(move)
-            print_board(game_instance)
-
-        print(f"    You Lost\n\nFinal Score: {game_instance.score}\n\nPlay Again? (y/n)")
-        if input().lower() == 'n':
-            break
-    print('Thanks for playing.')
+        print(board_string)
 
 
-if __name__ == '__main__':
-    
+def train_agent():
     # Hyperparameters
     num_iterations = 200 # @param {type:"integer"}
     collect_episodes_per_iteration = 2 # @param {type:"integer"}
     replay_buffer_capacity = 2000 # @param {type:"integer"}
-
-    fc_layer_params = (256,256)
+    
+    # (filters, kernel_size, stride)
+    conv_layer_params = [(32, 3, 1),
+                         (32, 3, 1),
+                         (32, 3, 1)]
+    fc_layer_params = (100,100)
 
     learning_rate = 1e-3 # @param {type:"number"}
     log_interval = 25 # @param {type:"integer"}
@@ -350,6 +334,7 @@ if __name__ == '__main__':
     actor_net = actor_distribution_network.ActorDistributionNetwork(
         train_env.observation_spec(),
         train_env.action_spec(),
+        conv_layer_params=conv_layer_params,
         fc_layer_params=fc_layer_params)
 
     # Optimiser
@@ -467,3 +452,58 @@ if __name__ == '__main__':
     plt.xlabel('Step')
     #plt.ylim(top=250)
     plt.show()
+
+
+def test_env():
+    move_dict = {'quit': 'q',
+                 'q': 'q',
+                 'w': 0,
+                 'd': 1,
+                 's': 2,
+                 'a': 3,
+                 'shhh': 'shhh'
+                 }
+    
+    verbose = True
+    def get_move():
+        nonlocal verbose
+        move = None
+        while move is None:
+            try:
+                move = move_dict[input().lower()]
+            except KeyError:
+                if verbose:
+                    print("Invalid move.")
+            else:
+                if move == 'shhh':
+                    verbose = False
+                    move = None
+        return move
+
+    print("""To play, use the 'wasd' keys to input moves.
+To quit, type 'quit' or 'q'.
+To stop the 'Invlaid move.' dialogue, type 'shhh'.
+Follow all inputs with a newline press.
+    """)
+
+    play = True
+
+    while play == True:
+        gameLost = False
+        game_instance = GameEnv2048()
+        print_board(game_instance)
+        while not gameLost:
+            move = get_move()
+            if move == 'q':
+                break
+            game_instance._step(move)
+            game_instance.print_board()
+
+        print(f"    You Lost\n\nFinal Score: {game_instance.score}\n\nPlay Again? (y/n)")
+        if input().lower() == 'n':
+            break
+    print('Thanks for playing.')
+
+
+if __name__ == '__main__':
+    train_agent()
