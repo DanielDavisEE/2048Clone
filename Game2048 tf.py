@@ -9,10 +9,19 @@ import numpy as np
 import random as rd
 import matplotlib.pyplot as plt
 import reverb
+import os
+import tempfile
+import time
+import gin
 
-from tf_agents.utils import common
+from typing import Any, Iterable, Optional, Text
+
 from tf_agents.drivers import py_driver
 from tf_agents.metrics import py_metrics
+from tf_agents.typing import types
+
+from tf_agents.utils import common
+from tf_agents.utils import numpy_storage
 
 from tf_agents.specs import array_spec
 from tf_agents.specs import tensor_spec
@@ -71,7 +80,8 @@ class GameEnv2048(py_environment.PyEnvironment):
         self._observation_spec = array_spec.BoundedArraySpec(
             shape=(4,4,1), dtype=np.float32, minimum=0, name='observation')
 
-        self._step_cap = 10
+        self._step_cap = 500
+        self._repeated_step_cap = 10
         self._softmax = tf.keras.layers.Softmax()
 
         self._state = np.zeros([4, 4], dtype=np.float32)
@@ -98,11 +108,11 @@ class GameEnv2048(py_environment.PyEnvironment):
         self._episode_ended = False
         self.condition_state()
         return ts.restart(np.array(self.condition_state(), dtype=np.float32))
-    
+
     def condition_state(self):
         tmp = self._state.copy().reshape(4,4,1)
         return np.log2(tmp, out=tmp, where=tmp!=0)
-    
+
     def _step(self, action):
         """
         up:    0
@@ -110,11 +120,12 @@ class GameEnv2048(py_environment.PyEnvironment):
         down:  2
         left:  3
         """
-        if self._steps_since_score_increase >= self._step_cap:
-            return ts.termination(self.condition_state(), self._score) 
+        if self._steps_since_score_increase >= self._step_cap or self._steps >= self._step_cap:
+            exponent_based = self.condition_state()
+            return ts.termination(exponent_based, reward=exponent_based.max()) 
         self._steps += 1
         self._steps_since_score_increase += 1
-        
+
         if type(action) is int:
             direction = action
         else:
@@ -140,11 +151,11 @@ class GameEnv2048(py_environment.PyEnvironment):
                     continue
 
                 self._move_tile((m, n), direction)
-        
+
         merges = self._merged.sum()
         self._merged = np.zeros([4, 4], dtype=np.bool8)
         gameLost = self._spawn_tile()
-        
+
         if gameLost:
             self._episode_ended = True
 
@@ -174,7 +185,7 @@ class GameEnv2048(py_environment.PyEnvironment):
         current_coords -> (row, col)
         merged -> bool
         inPlace -> bool
-        
+
         up:    0
         right: 1
         down:  2
@@ -192,7 +203,7 @@ class GameEnv2048(py_environment.PyEnvironment):
                 return c[0], c[1] - 1
             else:
                 raise ValueError
-            
+
         inBounds = lambda c: 0 <= c[0] < 4 and 0 <= c[1] < 4
 
         safe_coords = coords
@@ -262,7 +273,7 @@ class GameEnv2048(py_environment.PyEnvironment):
         """
         empty_tiles = (self._state == 0).sum()
         assert empty_tiles > 0
-            
+
         def isGameOver():
             """
             If the game board is full, check for potential tile merges which would allow further moves.
@@ -272,17 +283,17 @@ class GameEnv2048(py_environment.PyEnvironment):
                     if(self._state[i, j] == self._state[i + 1, j] or
                        self._state[i, j] == self._state[i, j + 1]):
                         return False
-         
+
             for j in range(3):
                 if(self._state[3, j] == self._state[3, j + 1]):
                     return False
-         
+
             for i in range(3):
                 if(self._state[i, 3] == self._state[i + 1, 3]):
                     return False
-                
+
             return True
-        
+
         gameOver = False
         for _ in range(repeat):
             index = rd.randrange(0, empty_tiles)
@@ -297,7 +308,7 @@ class GameEnv2048(py_environment.PyEnvironment):
                             self._state[i,j] = 2 if rd.random() < 0.9 else 4
                             empty_tiles -= 1
                             break
-                        
+
                 if index < 0:
                     break
 
@@ -323,158 +334,278 @@ class GameEnv2048(py_environment.PyEnvironment):
         print(board_string)
 
 
+class CustomNumpyDeque(py_metrics.NumpyDeque):
+    def max(self, dtype: Optional[np.dtype] = None):
+        if self._len == self._buffer.shape[0]:
+            return np.max(self._buffer).astype(dtype)
+    
+        assert self._start_index == 0
+        return np.max(self._buffer[:self._len]).astype(dtype)
+
+@gin.configurable
+class MaxTileMetric(py_metrics.StreamingMetric):
+    """Computes the average episode length."""
+
+    def __init__(self,
+                 name: Text = 'MaxTile',
+                 buffer_size: types.Int = 10,
+                 batch_size: Optional[types.Int] = None):
+        """Creates an MaxTileMetric."""
+        self._np_state = numpy_storage.NumpyState()
+        # Set a dummy value on self._np_state.episode_return so it gets included in
+        # the first checkpoint (before metric is first called).
+        self._np_state.max_tile = np.int64(0)
+        super(MaxTileMetric, self).__init__(
+            name, buffer_size=buffer_size, batch_size=batch_size)
+        self._buffer = CustomNumpyDeque(maxlen=buffer_size, dtype=np.float64)
+
+    def _reset(self, batch_size):
+        """Resets stat gathering variables."""
+        self._np_state.max_tile = np.zeros(
+            shape=(batch_size,), dtype=np.int64)
+
+    def _batched_call(self, trajectory):
+        """Processes the trajectory to update the metric.
+        Args:
+          trajectory: a tf_agents.trajectory.Trajectory.
+        """
+        max_tile = self._np_state.max_tile
+
+        max_tile = np.maximum(max_tile, 2 ** trajectory[1].max())
+
+        is_last = np.where(trajectory.is_last())
+        self.add_to_buffer(max_tile[is_last])
+
+    def result(self) -> np.float32:
+        """Returns the value of this metric."""
+        if self._buffer:
+            return self._buffer.max(dtype=np.int32)
+        return np.array(0, dtype=np.int32)
+
+
 def train_agent():
     # Hyperparameters
-    num_iterations = 10000 # @param {type:"integer"}
-    collect_episodes_per_iteration = 5 # @param {type:"integer"}
-    replay_buffer_capacity = 2000 # @param {type:"integer"}
-    
-    # (filters, kernel_size, stride)
-    conv_layer_params = None#[(32, 3, 1),
-                         #(64, 2, 1)]
-    fc_layer_params = [300, 300, 200, 200, 100]
-    dropout_layer_params = [0.75, 0.75, 0.75, 0.75, 0.75]
+    tempdir = tempfile.gettempdir()
 
-    learning_rate = 1e-3 # @param {type:"number"}
-    log_interval = 25 # @param {type:"integer"}
-    num_eval_episodes = 10 # @param {type:"integer"}
-    eval_interval = 50 # @param {type:"integer"}
+    # Use "num_iterations = 1e6" for better results (2 hrs)
+    # 1e5 is just so this doesn't take too long (1 hr)
+    num_iterations = 100000 # @param {type:"integer"}
+
+    initial_collect_steps = 100 # @param {type:"integer"}
+    initial_collect_episodes = 100 # @param {type:"integer"}
+    collect_episodes_per_iteration = 1 # @param {type:"integer"}
+    replay_buffer_capacity = initial_collect_steps * initial_collect_episodes # @param {type:"integer"}
+
+    batch_size = 256 # @param {type:"integer"}
+
+    critic_learning_rate = 3e-4 # @param {type:"number"}
+    actor_learning_rate = 3e-4 # @param {type:"number"}
+    alpha_learning_rate = 3e-4 # @param {type:"number"}
+    target_update_tau = 0.005 # @param {type:"number"}
+    target_update_period = 1 # @param {type:"number"}
+    gamma = 0.99 # @param {type:"number"}
+    reward_scale_factor = 1.0 # @param {type:"number"}
+
+    actor_fc_layer_params = (256, 256)
+    critic_joint_fc_layer_params = (256, 256)
+
+    log_interval = 1000 # @param {type:"integer"}
+
+    num_eval_episodes = 20 # @param {type:"integer"}
+    eval_interval = 10000 # @param {type:"integer"}
+
+    policy_save_interval = 5000 # @param {type:"integer"}
 
     # Environment
-    train_py_env = GameEnv2048()
-    eval_py_env = GameEnv2048()
-
-    #env_name = "CartPole-v0" # @param {type:"string"}
-    #train_py_env = suite_gym.load(env_name)
-    #eval_py_env = suite_gym.load(env_name)
-
-    train_env = tf_py_environment.TFPyEnvironment(train_py_env)
-    eval_env = tf_py_environment.TFPyEnvironment(eval_py_env)
+    collect_env = GameEnv2048()
+    eval_env = GameEnv2048()    
 
     # Agent
+    observation_spec, action_spec, time_step_spec = (
+        spec_utils.get_tensor_specs(collect_env))
+
+    critic_net = critic_network.CriticNetwork(
+        (observation_spec, action_spec),
+        observation_fc_layer_params=None,
+        action_fc_layer_params=None,
+        joint_fc_layer_params=critic_joint_fc_layer_params,
+        kernel_initializer='glorot_uniform',
+        last_kernel_initializer='glorot_uniform')
+
     actor_net = actor_distribution_network.ActorDistributionNetwork(
-        train_env.observation_spec(),
-        train_env.action_spec(),
-        conv_layer_params=conv_layer_params,
-        fc_layer_params=fc_layer_params,
-        dropout_layer_params=dropout_layer_params)
+        observation_spec,
+        action_spec,
+        fc_layer_params=actor_fc_layer_params,
+        continuous_projection_net=(
+            tanh_normal_projection_network.TanhNormalProjectionNetwork))
 
-    # Optimiser
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    train_step = train_utils.create_train_step()
 
-    train_step_counter = tf.Variable(0)
-
-    tf_agent = reinforce_agent.ReinforceAgent(
-        train_env.time_step_spec(),
-        train_env.action_spec(),
+    tf_agent = sac_agent.SacAgent(
+        time_step_spec,
+        action_spec,
         actor_network=actor_net,
-        optimizer=optimizer,
-        normalize_returns=True,
-        train_step_counter=train_step_counter)
+        critic_network=critic_net,
+        actor_optimizer=tf.compat.v1.train.AdamOptimizer(
+            learning_rate=actor_learning_rate),
+        critic_optimizer=tf.compat.v1.train.AdamOptimizer(
+            learning_rate=critic_learning_rate),
+        alpha_optimizer=tf.compat.v1.train.AdamOptimizer(
+            learning_rate=alpha_learning_rate),
+        target_update_tau=target_update_tau,
+        target_update_period=target_update_period,
+        td_errors_loss_fn=tf.math.squared_difference,
+        gamma=gamma,
+        reward_scale_factor=reward_scale_factor,
+        train_step_counter=train_step)
+
     tf_agent.initialize()
 
-    # Metrics and Evaluation
-    def compute_avg_return(environment, policy, num_episodes=10):
-
-        total_return = 0.0
-        max_tile = 0
-        for _ in range(num_episodes):
-
-            time_step = environment.reset()
-            episode_return = 0.0
-
-            while not time_step.is_last():
-                action_step = policy.action(time_step)
-                time_step = environment.step(action_step.action)
-                episode_return += time_step.reward
-                max_tile = max(max_tile, 2 ** time_step[3].numpy().max())
-            total_return += episode_return
-
-        avg_return = total_return / num_episodes
-        return avg_return.numpy()[0], max_tile
-
     # Replay Buffer
+    #rate_limiter=reverb.rate_limiters.SampleToInsertRatio(samples_per_insert=3.0, min_size_to_sample=3, error_buffer=3.0)
     table_name = 'uniform_table'
-    replay_buffer_signature = tensor_spec.from_spec(
-        tf_agent.collect_data_spec)
-    replay_buffer_signature = tensor_spec.add_outer_dim(
-        replay_buffer_signature)
     table = reverb.Table(
         table_name,
         max_size=replay_buffer_capacity,
         sampler=reverb.selectors.Uniform(),
         remover=reverb.selectors.Fifo(),
-        rate_limiter=reverb.rate_limiters.MinSize(1),
-        signature=replay_buffer_signature)
+        rate_limiter=reverb.rate_limiters.MinSize(1))
 
     reverb_server = reverb.Server([table])
 
-    replay_buffer = reverb_replay_buffer.ReverbReplayBuffer(
+    reverb_replay = reverb_replay_buffer.ReverbReplayBuffer(
         tf_agent.collect_data_spec,
+        sequence_length=2,
         table_name=table_name,
-        sequence_length=None,
         local_server=reverb_server)
 
-    rb_observer = reverb_utils.ReverbAddEpisodeObserver(
-        replay_buffer.py_client,
+    dataset = reverb_replay.as_dataset(
+        sample_batch_size=batch_size, num_steps=2).prefetch(50)
+    experience_dataset_fn = lambda: dataset
+
+    # Policies
+    tf_eval_policy = tf_agent.policy
+    eval_policy = py_tf_eager_policy.PyTFEagerPolicy(
+        tf_eval_policy, use_tf_function=True)
+
+    tf_collect_policy = tf_agent.collect_policy
+    collect_policy = py_tf_eager_policy.PyTFEagerPolicy(
+        tf_collect_policy, use_tf_function=True)
+
+    random_policy = random_py_policy.RandomPyPolicy(
+        collect_env.time_step_spec(), collect_env.action_spec())
+
+    # Actors
+    rb_observer = reverb_utils.ReverbAddTrajectoryObserver(
+        reverb_replay.py_client,
         table_name,
-        replay_buffer_capacity
+        sequence_length=2,
+        stride_length=1)
+
+    initial_collect_actor = actor.Actor(
+        collect_env,
+        random_policy,
+        train_step,
+        steps_per_run=initial_collect_steps,
+        episodes_per_run=initial_collect_episodes,
+        observers=[rb_observer])
+    initial_collect_actor.run()
+
+    env_step_metric = py_metrics.EnvironmentSteps()
+    collect_actor = actor.Actor(
+        collect_env,
+        collect_policy,
+        train_step,
+        episodes_per_run=collect_episodes_per_iteration,
+        metrics=actor.collect_metrics(10),
+        summary_dir=os.path.join(tempdir, learner.TRAIN_DIR),
+        observers=[rb_observer, env_step_metric])
+
+    eval_metrics = actor.eval_metrics(num_eval_episodes)
+    eval_metrics.append(MaxTileMetric(buffer_size=num_eval_episodes))
+    eval_actor = actor.Actor(
+        eval_env,
+        eval_policy,
+        train_step,
+        episodes_per_run=num_eval_episodes,
+        metrics=eval_metrics,
+        summary_dir=os.path.join(tempdir, 'eval'),
     )
 
-    # Data Collection
-    def collect_episode(environment, policy, num_episodes):
+    # Learners
+    saved_model_dir = os.path.join(tempdir, learner.POLICY_SAVED_MODEL_DIR)
 
-        driver = py_driver.PyDriver(
-            environment,
-            py_tf_eager_policy.PyTFEagerPolicy(
-                policy, use_tf_function=True),
-            [rb_observer],
-            max_episodes=num_episodes)
-        initial_time_step = environment.reset()
-        driver.run(initial_time_step)
+    # Triggers to save the agent's policy checkpoints.
+    learning_triggers = [
+        triggers.PolicySavedModelTrigger(
+            saved_model_dir,
+            tf_agent,
+            train_step,
+            interval=policy_save_interval),
+        triggers.StepPerSecondLogTrigger(train_step, interval=1000),
+    ]
+
+    agent_learner = learner.Learner(
+        tempdir,
+        train_step,
+        tf_agent,
+        experience_dataset_fn,
+        triggers=learning_triggers)
+
+    # Metrics and Evaluation
+    def get_eval_metrics():
+        eval_actor.run()
+        results = {}
+        for metric in eval_actor.metrics:
+            results[metric.name] = metric.result()
+        return results
+
+    metrics = get_eval_metrics()
+
+    def log_eval_metrics(step, metrics):
+        eval_results = (', ').join(
+            f'{name} = {result:.2f}' for name, result in metrics.items())
+        print(f'step = {step}: {eval_results}')
+
+    log_eval_metrics(0, metrics)
 
     # Training the Agent
-
-    # (Optional) Optimize by wrapping some of the code in a graph using TF function.
-    tf_agent.train = common.function(tf_agent.train)
-
     # Reset the train step
     tf_agent.train_step_counter.assign(0)
 
     # Evaluate the agent's policy once before training.
-    avg_return = compute_avg_return(eval_env, tf_agent.policy, num_eval_episodes)
+    avg_return = get_eval_metrics()["AverageReturn"]
     returns = [avg_return]
 
-    print("Starting training...")
+    start_time = time.time()
     for _ in range(num_iterations):
+        # Training.
+        collect_actor.run()
+        loss_info = agent_learner.run(iterations=1)
 
-        # Collect a few episodes using collect_policy and save to the replay buffer.
-        collect_episode(
-            train_py_env, tf_agent.collect_policy, collect_episodes_per_iteration)
+        # Evaluating.
+        step = agent_learner.train_step_numpy
 
-        # Use data from the buffer and update the agent's network.
-        iterator = iter(replay_buffer.as_dataset(sample_batch_size=1))
-        trajectories, _ = next(iterator)
-        train_loss = tf_agent.train(experience=trajectories)  
+        #if int(np.log2(step)) == np.log2(step):
+            #print(f"Training Step: {step:>6} ({time.time() - start_time:.2f} s)")
 
-        replay_buffer.clear()
+        if eval_interval and step % eval_interval == 0:
+            metrics = get_eval_metrics()
+            log_eval_metrics(step, metrics)
+            returns.append(metrics["AverageReturn"])
 
-        step = tf_agent.train_step_counter.numpy()
+        if log_interval and step % log_interval == 0:
+            print(f'step = {step}: loss = {loss_info.loss.numpy()}')
 
-        if step % log_interval == 0:
-            print(f'step = {step}: loss = {train_loss.loss}')
+    rb_observer.close()
+    reverb_server.stop()
 
-        if step % eval_interval == 0:
-            avg_return, max_tile = compute_avg_return(eval_env, tf_agent.policy, num_eval_episodes)
-            print(f'step = {step}: Average Return = {avg_return}, Max Tile = {max_tile}')
-            returns.append(avg_return)
-
-    # Visualisation    
+    # Visualization
     steps = range(0, num_iterations + 1, eval_interval)
     plt.plot(steps, returns)
     plt.ylabel('Average Return')
     plt.xlabel('Step')
-    #plt.ylim(top=250)
+    plt.ylim()
     plt.show()
 
 
@@ -487,7 +618,7 @@ def test_env():
                  'a': 3,
                  'shhh': 'shhh'
                  }
-    
+
     verbose = True
     def get_move():
         nonlocal verbose
