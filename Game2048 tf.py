@@ -10,6 +10,10 @@ import random as rd
 import matplotlib.pyplot as plt
 import reverb
 
+from tf_agents.utils import common
+from tf_agents.drivers import py_driver
+from tf_agents.metrics import py_metrics
+
 from tf_agents.specs import array_spec
 from tf_agents.specs import tensor_spec
 
@@ -23,28 +27,41 @@ from tf_agents.environments import utils
 from tf_agents.environments import wrappers
 from tf_agents.environments import suite_gym
 
+from tf_agents.policies import actor_policy
+from tf_agents.policies import q_policy
+from tf_agents.policies import greedy_policy
+
 from tf_agents.policies import py_policy
 from tf_agents.policies import random_py_policy
 from tf_agents.policies import scripted_py_policy
 
 from tf_agents.policies import tf_policy
 from tf_agents.policies import random_tf_policy
-from tf_agents.policies import actor_policy
-from tf_agents.policies import q_policy
-from tf_agents.policies import greedy_policy
 from tf_agents.policies import py_tf_eager_policy
 
 from tf_agents.trajectories import trajectory
 from tf_agents.trajectories import time_step as ts
 
 from tf_agents.agents.reinforce import reinforce_agent
-
-from tf_agents.drivers import py_driver
+from tf_agents.agents.ddpg import critic_network
+from tf_agents.agents.sac import sac_agent
+from tf_agents.agents.sac import tanh_normal_projection_network
 
 from tf_agents.replay_buffers import reverb_replay_buffer
 from tf_agents.replay_buffers import reverb_utils
 
-from tf_agents.utils import common
+from tf_agents.train import actor
+from tf_agents.train import learner
+from tf_agents.train import triggers
+
+from tf_agents.train.utils import spec_utils
+from tf_agents.train.utils import strategy_utils
+from tf_agents.train.utils import train_utils
+
+ACTION_UP = 0
+ACTION_RIGHT = 1
+ACTION_DOWN = 2
+ACTION_LEFT = 3
 
 class GameEnv2048(py_environment.PyEnvironment):
 
@@ -52,7 +69,7 @@ class GameEnv2048(py_environment.PyEnvironment):
         self._action_spec = array_spec.BoundedArraySpec(
             shape=(4,), dtype=np.float32, minimum=0, maximum=1, name='action')
         self._observation_spec = array_spec.BoundedArraySpec(
-            shape=(1,4,4,1), dtype=np.float32, minimum=0, name='observation')
+            shape=(4,4,1), dtype=np.float32, minimum=0, name='observation')
 
         self._step_cap = 10
         self._softmax = tf.keras.layers.Softmax()
@@ -61,6 +78,7 @@ class GameEnv2048(py_environment.PyEnvironment):
         self._merged = np.zeros([4, 4], dtype=np.bool8)
         self._spawn_tile(2)
         self._score = np.array(0, dtype=np.float32)
+        self._steps = 0
         self._steps_since_score_increase = 0
         self._episode_ended = False
 
@@ -75,10 +93,16 @@ class GameEnv2048(py_environment.PyEnvironment):
         self._merged = np.zeros([4, 4], dtype=np.bool8)
         self._spawn_tile(2)
         self._score = np.array(0, dtype=np.float32)
+        self._steps = 0
         self._steps_since_score_increase = 0
         self._episode_ended = False
-        return ts.restart(np.array(self._state.reshape(1,4,4,1), dtype=np.float32))
-
+        self.condition_state()
+        return ts.restart(np.array(self.condition_state(), dtype=np.float32))
+    
+    def condition_state(self):
+        tmp = self._state.copy().reshape(4,4,1)
+        return np.log2(tmp, out=tmp, where=tmp!=0)
+    
     def _step(self, action):
         """
         up:    0
@@ -87,26 +111,27 @@ class GameEnv2048(py_environment.PyEnvironment):
         left:  3
         """
         if self._steps_since_score_increase >= self._step_cap:
-            return ts.termination(self._state.reshape(1,4,4,1), self._score) 
+            return ts.termination(self.condition_state(), self._score) 
+        self._steps += 1
         self._steps_since_score_increase += 1
         
         if type(action) is int:
             direction = action
         else:
-            directions = [0, 1, 2, 3]
+            directions = [ACTION_UP, ACTION_RIGHT, ACTION_DOWN, ACTION_LEFT]
             direction = np.random.choice(
                 directions, 
                 p=self._softmax(action).numpy()
             )
 
         if not self._check_viable_move(direction):
-            return ts.transition(self._state.reshape(1,4,4,1), reward=0.0, discount=1.0)
+            return ts.transition(self.condition_state(), reward=-0.1, discount=0.995)
 
         row_iter = (0, 4)
-        if direction == 2: # If direction is down, iterate rows upwards
+        if direction == ACTION_DOWN: # If direction is down, iterate rows upwards
             row_iter = (3, -1, -1)
         col_iter = (0, 4)
-        if direction == 1: # If direction is right, iterate columns leftwards
+        if direction == ACTION_RIGHT: # If direction is right, iterate columns leftwards
             col_iter = (3, -1, -1)
 
         for m in range(*row_iter):
@@ -115,7 +140,8 @@ class GameEnv2048(py_environment.PyEnvironment):
                     continue
 
                 self._move_tile((m, n), direction)
-
+        
+        merges = self._merged.sum()
         self._merged = np.zeros([4, 4], dtype=np.bool8)
         gameLost = self._spawn_tile()
         
@@ -123,9 +149,10 @@ class GameEnv2048(py_environment.PyEnvironment):
             self._episode_ended = True
 
         if self._episode_ended:
-            return ts.termination(self._state.reshape(1,4,4,1), self._score)
+            exponent_based = self.condition_state()
+            return ts.termination(exponent_based, reward=exponent_based.max()+self._steps/100)
         else:
-            return ts.transition(self._state.reshape(1,4,4,1), reward=0.0, discount=0.95)
+            return ts.transition(self.condition_state(), reward=(merges-1)/8, discount=0.995)
 
     def _merge(self, coords, new_coords):
         """
@@ -154,17 +181,14 @@ class GameEnv2048(py_environment.PyEnvironment):
         left:  3
         """
 
-        isVert = action % 2 == 0
-        isPos = (action + 1) // 2 == 1
-
         def increment(c):
-            if action == 0: # Up
+            if action == ACTION_UP:
                 return c[0] - 1, c[1]
-            elif action == 1: # Right
+            elif action == ACTION_RIGHT:
                 return c[0], c[1] + 1
-            elif action == 2: # Down
+            elif action == ACTION_DOWN:
                 return c[0] + 1, c[1]
-            elif action == 3: # Left
+            elif action == ACTION_LEFT:
                 return c[0], c[1] - 1
             else:
                 raise ValueError
@@ -206,12 +230,12 @@ class GameEnv2048(py_environment.PyEnvironment):
         left:  3
         """
 
-        if action in [0, 3]:
+        if action in [ACTION_UP, ACTION_LEFT]:
             inner_iter = (0, 4)
         else:
             inner_iter = (3, -1, -1)
 
-        arrange_coords = lambda x, y: (y, x) if action in [0, 2] else (x, y)
+        arrange_coords = lambda x, y: (y, x) if action in [ACTION_UP, ACTION_DOWN] else (x, y)
 
         # Iterate orthogonally to the move
         for m in range(0, 4):
@@ -238,14 +262,11 @@ class GameEnv2048(py_environment.PyEnvironment):
         """
         empty_tiles = (self._state == 0).sum()
         assert empty_tiles > 0
-        
-        def increment(c):
-            if c[1] < 3:
-                return c[0], c[1] + 1
-            else:
-                return c[0] + 1, c[1]
             
         def isGameOver():
+            """
+            If the game board is full, check for potential tile merges which would allow further moves.
+            """
             for i in range(3):
                 for j in range(3):
                     if(self._state[i, j] == self._state[i + 1, j] or
@@ -304,15 +325,15 @@ class GameEnv2048(py_environment.PyEnvironment):
 
 def train_agent():
     # Hyperparameters
-    num_iterations = 200 # @param {type:"integer"}
-    collect_episodes_per_iteration = 2 # @param {type:"integer"}
+    num_iterations = 10000 # @param {type:"integer"}
+    collect_episodes_per_iteration = 5 # @param {type:"integer"}
     replay_buffer_capacity = 2000 # @param {type:"integer"}
     
     # (filters, kernel_size, stride)
-    conv_layer_params = [(32, 3, 1),
-                         (32, 3, 1),
-                         (32, 3, 1)]
-    fc_layer_params = (100,100)
+    conv_layer_params = None#[(32, 3, 1),
+                         #(64, 2, 1)]
+    fc_layer_params = [300, 300, 200, 200, 100]
+    dropout_layer_params = [0.75, 0.75, 0.75, 0.75, 0.75]
 
     learning_rate = 1e-3 # @param {type:"number"}
     log_interval = 25 # @param {type:"integer"}
@@ -335,7 +356,8 @@ def train_agent():
         train_env.observation_spec(),
         train_env.action_spec(),
         conv_layer_params=conv_layer_params,
-        fc_layer_params=fc_layer_params)
+        fc_layer_params=fc_layer_params,
+        dropout_layer_params=dropout_layer_params)
 
     # Optimiser
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
@@ -355,6 +377,7 @@ def train_agent():
     def compute_avg_return(environment, policy, num_episodes=10):
 
         total_return = 0.0
+        max_tile = 0
         for _ in range(num_episodes):
 
             time_step = environment.reset()
@@ -364,10 +387,11 @@ def train_agent():
                 action_step = policy.action(time_step)
                 time_step = environment.step(action_step.action)
                 episode_return += time_step.reward
+                max_tile = max(max_tile, 2 ** time_step[3].numpy().max())
             total_return += episode_return
 
         avg_return = total_return / num_episodes
-        return avg_return.numpy()[0]
+        return avg_return.numpy()[0], max_tile
 
     # Replay Buffer
     table_name = 'uniform_table'
@@ -438,11 +462,11 @@ def train_agent():
         step = tf_agent.train_step_counter.numpy()
 
         if step % log_interval == 0:
-            print('step = {0}: loss = {1}'.format(step, train_loss.loss))
+            print(f'step = {step}: loss = {train_loss.loss}')
 
         if step % eval_interval == 0:
-            avg_return = compute_avg_return(eval_env, tf_agent.policy, num_eval_episodes)
-            print('step = {0}: Average Return = {1}'.format(step, avg_return))
+            avg_return, max_tile = compute_avg_return(eval_env, tf_agent.policy, num_eval_episodes)
+            print(f'step = {step}: Average Return = {avg_return}, Max Tile = {max_tile}')
             returns.append(avg_return)
 
     # Visualisation    
